@@ -13,10 +13,13 @@ public static class TUnitActivitySource
     internal const string LifecycleSourceName = "TUnit.Lifecycle";
 
     /// <summary>
-    /// Activity source emitted by TUnit's ASP.NET Core HTTP propagation handlers.
-    /// Registered automatically on the SUT's <see cref="System.Diagnostics.ActivitySource"/>
-    /// listeners by <c>TestWebApplicationFactory</c>.
+    /// No longer emits spans. TUnit's ASP.NET Core HTTP propagation handler is now a pure
+    /// header propagator — the ASP.NET Core server span carries HTTP semantic-convention tags
+    /// for in-memory <c>WebApplicationFactory</c> traffic, and the runtime's
+    /// <c>System.Net.Http</c> ActivitySource emits the client span for SUT-initiated outbound
+    /// requests over real sockets.
     /// </summary>
+    [Obsolete("TUnit no longer emits spans under this source name. See the property remarks for the current trace topology. This constant is kept for binary compatibility and will be removed in a future major release.")]
     public const string AspNetCoreHttpSourceName = "TUnit.AspNetCore.Http";
 
     /// <summary>W3C baggage HTTP header name.</summary>
@@ -172,15 +175,16 @@ public static class TUnitActivitySource
             return;
         }
 
+        var exceptionType = exception.GetType().FullName ?? exception.GetType().Name;
         var tagsCollection = new ActivityTagsCollection
         {
-            { "exception.type", exception.GetType().FullName },
+            { "exception.type", exceptionType },
             { "exception.message", exception.Message },
             { "exception.stacktrace", exception.ToString() }
         };
 
         activity.AddEvent(new ActivityEvent("exception", tags: tagsCollection));
-        activity.SetTag("error.type", exception.GetType().FullName);
+        activity.SetTag("error.type", exceptionType);
         activity.SetStatus(ActivityStatusCode.Error, exception.Message);
     }
 

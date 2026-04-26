@@ -1,10 +1,14 @@
 using System.Linq;
 using TUnit.Mocks.SourceGenerator.Models;
+using static TUnit.Mocks.SourceGenerator.IdentifierEscaping;
 
 namespace TUnit.Mocks.SourceGenerator.Builders;
 
 internal static class MockImplBuilder
 {
+    // Suppresses CS9035: ctor claims responsibility for required members so factory can `new XxxMockImpl(engine)` without initializers.
+    private const string SetsRequiredMembersAttribute = "[global::System.Diagnostics.CodeAnalysis.SetsRequiredMembers]";
+
     public static void BuildInto(CodeWriter writer, MockTypeModel model)
     {
         var safeName = GetCompositeShortSafeName(model);
@@ -65,10 +69,16 @@ internal static class MockImplBuilder
             // Properties — skip static abstract (they're in bridge DIMs)
             foreach (var prop in model.Properties)
             {
-                if (prop.IsIndexer) continue;
                 if (prop.IsStaticAbstract) continue;
                 writer.AppendLine();
-                GenerateInterfaceProperty(writer, prop, model);
+                if (prop.IsIndexer)
+                {
+                    GenerateInterfaceIndexer(writer, prop);
+                }
+                else
+                {
+                    GenerateInterfaceProperty(writer, prop, model);
+                }
             }
 
             // Events — skip static abstract (they're in bridge DIMs)
@@ -113,10 +123,16 @@ internal static class MockImplBuilder
             // Properties — skip static abstract (they're in bridge DIMs)
             foreach (var prop in model.Properties)
             {
-                if (prop.IsIndexer) continue;
                 if (prop.IsStaticAbstract) continue;
                 writer.AppendLine();
-                GenerateWrapProperty(writer, prop, model);
+                if (prop.IsIndexer)
+                {
+                    GenerateWrapIndexer(writer, prop);
+                }
+                else
+                {
+                    GenerateWrapProperty(writer, prop, model);
+                }
             }
 
             // Events — skip static abstract (they're in bridge DIMs)
@@ -139,6 +155,7 @@ internal static class MockImplBuilder
 
         if (model.Constructors.Length == 0)
         {
+            writer.AppendLine(SetsRequiredMembersAttribute);
             using (writer.Block($"internal {safeName}WrapMockImpl(global::TUnit.Mocks.MockEngine<{mockableType}> engine, {model.FullyQualifiedName} wrappedInstance)"))
             {
                 writer.AppendLine("_engine = engine;");
@@ -155,6 +172,7 @@ internal static class MockImplBuilder
         {
             if (ctor.Parameters.Length == 0)
             {
+                writer.AppendLine(SetsRequiredMembersAttribute);
                 using (writer.Block($"internal {safeName}WrapMockImpl(global::TUnit.Mocks.MockEngine<{mockableType}> engine, {model.FullyQualifiedName} wrappedInstance) : base()"))
                 {
                     writer.AppendLine("_engine = engine;");
@@ -169,6 +187,7 @@ internal static class MockImplBuilder
             {
                 var paramList = string.Join(", ", ctor.Parameters.Select(p => $"{p.FullyQualifiedType} {p.Name}"));
                 var argList = string.Join(", ", ctor.Parameters.Select(p => p.Name));
+                writer.AppendLine(SetsRequiredMembersAttribute);
                 using (writer.Block($"internal {safeName}WrapMockImpl(global::TUnit.Mocks.MockEngine<{mockableType}> engine, {model.FullyQualifiedName} wrappedInstance, {paramList}) : base({argList})"))
                 {
                     writer.AppendLine("_engine = engine;");
@@ -192,7 +211,7 @@ internal static class MockImplBuilder
 
         // C# prohibits restating generic constraints on override methods (CS0460)
         var accessModifier = method.IsProtected ? "protected" : "public";
-        using (writer.Block($"{accessModifier} override {signatureReturnType} {method.Name}{typeParams}({paramList})"))
+        using (writer.Block($"{accessModifier} override {signatureReturnType} {EscapeIdentifier(method.Name)}{typeParams}({paramList})"))
         {
             if (method.IsAbstractMember)
             {
@@ -234,7 +253,7 @@ internal static class MockImplBuilder
             writer.AppendLine("return;");
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"_wrappedInstance.{method.Name}({argPassList});");
+            writer.AppendLine($"_wrappedInstance.{EscapeIdentifier(method.Name)}({argPassList});");
         }
         else if (method.IsVoid && method.IsAsync)
         {
@@ -252,7 +271,7 @@ internal static class MockImplBuilder
             }
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return _wrappedInstance.{method.Name}({argPassList});");
+            writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(method.Name)}({argPassList});");
         }
         else if (method.IsAsync)
         {
@@ -280,7 +299,7 @@ internal static class MockImplBuilder
             }
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return _wrappedInstance.{method.Name}({argPassList});");
+            writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(method.Name)}({argPassList});");
         }
         else if (method.IsRefStructReturn)
         {
@@ -298,7 +317,7 @@ internal static class MockImplBuilder
             }
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return _wrappedInstance.{method.Name}({argPassList});");
+            writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(method.Name)}({argPassList});");
         }
         else if (method.IsReturnTypeStaticAbstractInterface)
         {
@@ -310,7 +329,7 @@ internal static class MockImplBuilder
             writer.AppendLine("return __result;");
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return _wrappedInstance.{method.Name}({argPassList});");
+            writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(method.Name)}({argPassList});");
         }
         else
         {
@@ -321,7 +340,7 @@ internal static class MockImplBuilder
             writer.AppendLine("return __result;");
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return _wrappedInstance.{method.Name}({argPassList});");
+            writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(method.Name)}({argPassList});");
         }
     }
 
@@ -330,7 +349,7 @@ internal static class MockImplBuilder
         var accessModifier = prop.IsProtected ? "protected" : "public";
         var autoMockFactory = GetAutoMockFactoryLambda(prop);
         writer.AppendLineIfNotEmpty(prop.ObsoleteAttribute);
-        writer.AppendLine($"{accessModifier} override {prop.ReturnType} {prop.Name}");
+        writer.AppendLine($"{accessModifier} override {prop.ReturnType} {EscapeIdentifier(prop.Name)}");
         writer.OpenBrace();
 
         if (prop.HasGetter)
@@ -356,7 +375,7 @@ internal static class MockImplBuilder
                     writer.AppendLine("return default;");
                     writer.DecreaseIndent();
                     writer.AppendLine("}");
-                    writer.AppendLine($"return _wrappedInstance.{prop.Name};");
+                    writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(prop.Name)};");
                     writer.CloseBrace();
                 }
             }
@@ -378,7 +397,7 @@ internal static class MockImplBuilder
                 writer.AppendLine($"return ({prop.ReturnType})__rawResult!;");
                 writer.DecreaseIndent();
                 writer.AppendLine("}");
-                writer.AppendLine($"return _wrappedInstance.{prop.Name};");
+                writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(prop.Name)};");
                 writer.CloseBrace();
             }
             else
@@ -391,7 +410,7 @@ internal static class MockImplBuilder
                 writer.AppendLine("return __result;");
                 writer.DecreaseIndent();
                 writer.AppendLine("}");
-                writer.AppendLine($"return _wrappedInstance.{prop.Name};");
+                writer.AppendLine($"return _wrappedInstance.{EscapeIdentifier(prop.Name)};");
                 writer.CloseBrace();
             }
         }
@@ -414,7 +433,7 @@ internal static class MockImplBuilder
                 writer.AppendLine($"if (!_engine.TryHandleCall({prop.SetterMemberId}, \"set_{prop.Name}\", {setterArgs}))");
                 writer.AppendLine("{");
                 writer.IncreaseIndent();
-                writer.AppendLine($"_wrappedInstance.{prop.Name} = value;");
+                writer.AppendLine($"_wrappedInstance.{EscapeIdentifier(prop.Name)} = value;");
                 writer.DecreaseIndent();
                 writer.AppendLine("}");
                 writer.CloseBrace();
@@ -451,10 +470,16 @@ internal static class MockImplBuilder
             // Properties — skip static abstract (they're in bridge DIMs)
             foreach (var prop in model.Properties)
             {
-                if (prop.IsIndexer) continue;
                 if (prop.IsStaticAbstract) continue;
                 writer.AppendLine();
-                GeneratePartialProperty(writer, prop, model);
+                if (prop.IsIndexer)
+                {
+                    GeneratePartialIndexer(writer, prop);
+                }
+                else
+                {
+                    GeneratePartialProperty(writer, prop, model);
+                }
             }
 
             // Events — skip static abstract (they're in bridge DIMs)
@@ -478,6 +503,7 @@ internal static class MockImplBuilder
         if (model.Constructors.Length == 0)
         {
             // No explicit constructors found, generate a default one
+            writer.AppendLine(SetsRequiredMembersAttribute);
             using (writer.Block($"internal {safeName}MockImpl(global::TUnit.Mocks.MockEngine<{mockableType}> engine)"))
             {
                 writer.AppendLine("_engine = engine;");
@@ -494,6 +520,7 @@ internal static class MockImplBuilder
             if (ctor.Parameters.Length == 0)
             {
                 // Parameterless constructor
+                writer.AppendLine(SetsRequiredMembersAttribute);
                 using (writer.Block($"internal {safeName}MockImpl(global::TUnit.Mocks.MockEngine<{mockableType}> engine) : base()"))
                 {
                     writer.AppendLine("_engine = engine;");
@@ -508,6 +535,7 @@ internal static class MockImplBuilder
                 // Constructor with parameters - pass them through to base
                 var paramList = string.Join(", ", ctor.Parameters.Select(p => $"{p.FullyQualifiedType} {p.Name}"));
                 var argList = string.Join(", ", ctor.Parameters.Select(p => p.Name));
+                writer.AppendLine(SetsRequiredMembersAttribute);
                 using (writer.Block($"internal {safeName}MockImpl(global::TUnit.Mocks.MockEngine<{mockableType}> engine, {paramList}) : base({argList})"))
                 {
                     writer.AppendLine("_engine = engine;");
@@ -536,12 +564,12 @@ internal static class MockImplBuilder
                 // Return type is compatible (e.g. IEnumerable.GetEnumerator → IEnumerable<T>.GetEnumerator)
                 // — delegate to the public method.
                 var argPassList = GetArgPassList(method);
-                writer.AppendLine($"{signatureReturnType} {method.ExplicitInterfaceName}.{method.Name}{typeParams}({paramList}){constraints} => {method.Name}({argPassList});");
+                writer.AppendLine($"{signatureReturnType} {method.ExplicitInterfaceName}.{EscapeIdentifier(method.Name)}{typeParams}({paramList}){constraints} => {EscapeIdentifier(method.Name)}({argPassList});");
             }
             else
             {
                 // Return types are incompatible — dispatch through the engine with a dedicated member id.
-                using (writer.Block($"{signatureReturnType} {method.ExplicitInterfaceName}.{method.Name}{typeParams}({paramList}){constraints}"))
+                using (writer.Block($"{signatureReturnType} {method.ExplicitInterfaceName}.{EscapeIdentifier(method.Name)}{typeParams}({paramList}){constraints}"))
                 {
                     GenerateEngineDispatchBody(writer, method);
                 }
@@ -549,7 +577,7 @@ internal static class MockImplBuilder
             return;
         }
 
-        using (writer.Block($"public {signatureReturnType} {method.Name}{typeParams}({paramList}){constraints}"))
+        using (writer.Block($"public {signatureReturnType} {EscapeIdentifier(method.Name)}{typeParams}({paramList}){constraints}"))
         {
             GenerateEngineDispatchBody(writer, method);
         }
@@ -566,7 +594,7 @@ internal static class MockImplBuilder
 
         // C# prohibits restating generic constraints on override methods (CS0460)
         var accessModifier = method.IsProtected ? "protected" : "public";
-        using (writer.Block($"{accessModifier} override {signatureReturnType} {method.Name}{typeParams}({paramList})"))
+        using (writer.Block($"{accessModifier} override {signatureReturnType} {EscapeIdentifier(method.Name)}{typeParams}({paramList})"))
         {
             if (method.IsAbstractMember)
             {
@@ -608,7 +636,7 @@ internal static class MockImplBuilder
             writer.AppendLine("return;");
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"base.{method.Name}{GetTypeParameterList(method)}({argPassList});");
+            writer.AppendLine($"base.{EscapeIdentifier(method.Name)}{GetTypeParameterList(method)}({argPassList});");
         }
         else if (method.IsVoid && method.IsAsync)
         {
@@ -628,7 +656,7 @@ internal static class MockImplBuilder
             }
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return base.{method.Name}{GetTypeParameterList(method)}({argPassList});");
+            writer.AppendLine($"return base.{EscapeIdentifier(method.Name)}{GetTypeParameterList(method)}({argPassList});");
         }
         else if (method.IsAsync)
         {
@@ -658,7 +686,7 @@ internal static class MockImplBuilder
             }
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return base.{method.Name}{GetTypeParameterList(method)}({argPassList});");
+            writer.AppendLine($"return base.{EscapeIdentifier(method.Name)}{GetTypeParameterList(method)}({argPassList});");
         }
         else if (method.IsRefStructReturn)
         {
@@ -677,7 +705,7 @@ internal static class MockImplBuilder
             }
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return base.{method.Name}{GetTypeParameterList(method)}({argPassList});");
+            writer.AppendLine($"return base.{EscapeIdentifier(method.Name)}{GetTypeParameterList(method)}({argPassList});");
         }
         else if (method.IsReturnTypeStaticAbstractInterface)
         {
@@ -689,7 +717,7 @@ internal static class MockImplBuilder
             writer.AppendLine("return __result;");
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return base.{method.Name}{GetTypeParameterList(method)}({argPassList});");
+            writer.AppendLine($"return base.{EscapeIdentifier(method.Name)}{GetTypeParameterList(method)}({argPassList});");
         }
         else
         {
@@ -701,7 +729,7 @@ internal static class MockImplBuilder
             writer.AppendLine("return __result;");
             writer.DecreaseIndent();
             writer.AppendLine("}");
-            writer.AppendLine($"return base.{method.Name}{GetTypeParameterList(method)}({argPassList});");
+            writer.AppendLine($"return base.{EscapeIdentifier(method.Name)}{GetTypeParameterList(method)}({argPassList});");
         }
     }
 
@@ -851,7 +879,7 @@ internal static class MockImplBuilder
         {
             // Explicit interface property with incompatible return type.
             // Dispatches independently through the engine with a dedicated MemberId.
-            writer.AppendLine($"{prop.ReturnType} {prop.ExplicitInterfaceName}.{prop.Name}");
+            writer.AppendLine($"{prop.ReturnType} {prop.ExplicitInterfaceName}.{EscapeIdentifier(prop.Name)}");
             writer.OpenBrace();
             if (prop.HasGetter)
             {
@@ -867,7 +895,7 @@ internal static class MockImplBuilder
             return;
         }
 
-        writer.AppendLine($"public {prop.ReturnType} {prop.Name}");
+        writer.AppendLine($"public {prop.ReturnType} {EscapeIdentifier(prop.Name)}");
         writer.OpenBrace();
 
         if (prop.HasGetter)
@@ -914,7 +942,7 @@ internal static class MockImplBuilder
         var accessModifier = prop.IsProtected ? "protected" : "public";
         var autoMockFactory = GetAutoMockFactoryLambda(prop);
         writer.AppendLineIfNotEmpty(prop.ObsoleteAttribute);
-        writer.AppendLine($"{accessModifier} override {prop.ReturnType} {prop.Name}");
+        writer.AppendLine($"{accessModifier} override {prop.ReturnType} {EscapeIdentifier(prop.Name)}");
         writer.OpenBrace();
 
         if (prop.HasGetter)
@@ -940,7 +968,7 @@ internal static class MockImplBuilder
                     writer.AppendLine("return default;");
                     writer.DecreaseIndent();
                     writer.AppendLine("}");
-                    writer.AppendLine($"return base.{prop.Name};");
+                    writer.AppendLine($"return base.{EscapeIdentifier(prop.Name)};");
                     writer.CloseBrace();
                 }
             }
@@ -963,7 +991,7 @@ internal static class MockImplBuilder
                 writer.AppendLine($"return ({prop.ReturnType})__rawResult!;");
                 writer.DecreaseIndent();
                 writer.AppendLine("}");
-                writer.AppendLine($"return base.{prop.Name};");
+                writer.AppendLine($"return base.{EscapeIdentifier(prop.Name)};");
                 writer.CloseBrace();
             }
             else
@@ -977,7 +1005,7 @@ internal static class MockImplBuilder
                 writer.AppendLine("return __result;");
                 writer.DecreaseIndent();
                 writer.AppendLine("}");
-                writer.AppendLine($"return base.{prop.Name};");
+                writer.AppendLine($"return base.{EscapeIdentifier(prop.Name)};");
                 writer.CloseBrace();
             }
         }
@@ -1001,7 +1029,7 @@ internal static class MockImplBuilder
                 writer.AppendLine($"if (!_engine.TryHandleCall({prop.SetterMemberId}, \"set_{prop.Name}\", {setterArgs}))");
                 writer.AppendLine("{");
                 writer.IncreaseIndent();
-                writer.AppendLine($"base.{prop.Name} = value;");
+                writer.AppendLine($"base.{EscapeIdentifier(prop.Name)} = value;");
                 writer.DecreaseIndent();
                 writer.AppendLine("}");
                 writer.CloseBrace();
@@ -1009,6 +1037,106 @@ internal static class MockImplBuilder
         }
 
         writer.CloseBrace();
+    }
+
+    private static void GenerateInterfaceIndexer(CodeWriter writer, MockMemberModel prop)
+    {
+        var paramList = FormatIndexerParameterList(prop);
+        writer.AppendLineIfNotEmpty(prop.ObsoleteAttribute);
+        writer.AppendLine($"public {prop.ReturnType} this[{paramList}]");
+        writer.OpenBrace();
+
+        if (prop.HasGetter)
+        {
+            var argsArray = GetIndexerGetterArgsArray(prop);
+            writer.AppendLineIfNotEmpty(prop.GetterObsoleteAttribute);
+            writer.AppendLine($"get => _engine.HandleCallWithReturn<{prop.ReturnType}>({prop.MemberId}, \"get_Item\", {argsArray}, {prop.SmartDefault});");
+        }
+
+        if (prop.HasSetter)
+        {
+            var setterArgs = GetIndexerSetterArgsArray(prop);
+            writer.AppendLineIfNotEmpty(prop.SetterObsoleteAttribute);
+            writer.AppendLine($"set => _engine.HandleCall({prop.SetterMemberId}, \"set_Item\", {setterArgs});");
+        }
+
+        writer.CloseBrace();
+    }
+
+    private static void GeneratePartialIndexer(CodeWriter writer, MockMemberModel prop)
+        => GenerateOverrideIndexer(writer, prop, fallbackTarget: "base");
+
+    private static void GenerateWrapIndexer(CodeWriter writer, MockMemberModel prop)
+        => GenerateOverrideIndexer(writer, prop, fallbackTarget: "_wrappedInstance");
+
+    private static void GenerateOverrideIndexer(CodeWriter writer, MockMemberModel prop, string fallbackTarget)
+    {
+        var accessModifier = prop.IsProtected ? "protected" : "public";
+        var paramList = FormatIndexerParameterList(prop);
+        var argPassList = string.Join(", ", prop.Parameters.Select(p => p.Name));
+        writer.AppendLineIfNotEmpty(prop.ObsoleteAttribute);
+        writer.AppendLine($"{accessModifier} override {prop.ReturnType} this[{paramList}]");
+        writer.OpenBrace();
+
+        if (prop.HasGetter)
+        {
+            var argsArray = GetIndexerGetterArgsArray(prop);
+            writer.AppendLineIfNotEmpty(prop.GetterObsoleteAttribute);
+            if (prop.IsAbstractMember)
+            {
+                writer.AppendLine($"get => _engine.HandleCallWithReturn<{prop.ReturnType}>({prop.MemberId}, \"get_Item\", {argsArray}, {prop.SmartDefault});");
+            }
+            else
+            {
+                writer.AppendLine("get");
+                writer.OpenBrace();
+                writer.AppendLine($"if (_engine.TryHandleCallWithReturn<{prop.ReturnType}>({prop.MemberId}, \"get_Item\", {argsArray}, {prop.SmartDefault}, out var __result))");
+                writer.OpenBrace();
+                writer.AppendLine("return __result;");
+                writer.CloseBrace();
+                writer.AppendLine($"return {fallbackTarget}[{argPassList}];");
+                writer.CloseBrace();
+            }
+        }
+
+        if (prop.HasSetter)
+        {
+            var setterArgs = GetIndexerSetterArgsArray(prop);
+            writer.AppendLineIfNotEmpty(prop.SetterObsoleteAttribute);
+            if (prop.IsAbstractMember)
+            {
+                writer.AppendLine($"set => _engine.HandleCall({prop.SetterMemberId}, \"set_Item\", {setterArgs});");
+            }
+            else
+            {
+                writer.AppendLine("set");
+                writer.OpenBrace();
+                writer.AppendLine($"if (!_engine.TryHandleCall({prop.SetterMemberId}, \"set_Item\", {setterArgs}))");
+                writer.OpenBrace();
+                writer.AppendLine($"{fallbackTarget}[{argPassList}] = value;");
+                writer.CloseBrace();
+                writer.CloseBrace();
+            }
+        }
+
+        writer.CloseBrace();
+    }
+
+    private static string FormatIndexerParameterList(MockMemberModel indexer)
+        => FormatParameterList(indexer.Parameters);
+
+    private static string GetIndexerGetterArgsArray(MockMemberModel indexer)
+    {
+        if (indexer.Parameters.Length == 0) return "global::System.Array.Empty<object?>()";
+        var args = string.Join(", ", indexer.Parameters.Select(p => p.Name));
+        return $"new object?[] {{ {args} }}";
+    }
+
+    private static string GetIndexerSetterArgsArray(MockMemberModel indexer)
+    {
+        if (indexer.Parameters.Length == 0) return "new object?[] { value }";
+        var args = string.Join(", ", indexer.Parameters.Select(p => p.Name)) + ", value";
+        return $"new object?[] {{ {args} }}";
     }
 
     private static void GenerateEvent(CodeWriter writer, MockEventModel evt)
@@ -1019,7 +1147,7 @@ internal static class MockImplBuilder
 
         // Event add/remove accessors
         writer.AppendLineIfNotEmpty(evt.ObsoleteAttribute);
-        writer.AppendLine($"public event {evt.EventHandlerTypeNonNullable}? {evt.Name}");
+        writer.AppendLine($"public event {evt.EventHandlerTypeNonNullable}? {EscapeIdentifier(evt.Name)}");
         writer.OpenBrace();
         writer.AppendLine($"add {{ _backing_{evt.Name} += value; _engine.RecordEventSubscription(\"{evt.Name}\", true); }}");
         writer.AppendLine($"remove {{ _backing_{evt.Name} -= value; _engine.RecordEventSubscription(\"{evt.Name}\", false); }}");
@@ -1053,7 +1181,7 @@ internal static class MockImplBuilder
 
         // Event add/remove accessors with override
         writer.AppendLineIfNotEmpty(evt.ObsoleteAttribute);
-        writer.AppendLine($"public override event {evt.EventHandlerTypeNonNullable}? {evt.Name}");
+        writer.AppendLine($"public override event {evt.EventHandlerTypeNonNullable}? {EscapeIdentifier(evt.Name)}");
         writer.OpenBrace();
         writer.AppendLine($"add {{ _backing_{evt.Name} += value; _engine.RecordEventSubscription(\"{evt.Name}\", true); }}");
         writer.AppendLine($"remove {{ _backing_{evt.Name} -= value; _engine.RecordEventSubscription(\"{evt.Name}\", false); }}");

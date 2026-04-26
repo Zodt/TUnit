@@ -29,7 +29,7 @@ public class AspireFixture<TAppHost> : IAsyncInitializer, IAsyncDisposable
 {
     private DistributedApplication? _app;
     private OtlpReceiver? _otlpReceiver;
-    private HttpMessageHandler? _httpHandler;
+    private SocketsHttpHandler? _httpHandler;
 
     /// <summary>
     /// The running Aspire distributed application.
@@ -55,16 +55,10 @@ public class AspireFixture<TAppHost> : IAsyncInitializer, IAsyncDisposable
             return App.CreateHttpClient(resourceName, endpointName);
         }
 
-        // Share a single handler across all HttpClient instances. The handler is stateless
-        // (reads Activity.Current which is async-local/per-test), so sharing is safe for
-        // correctness while reusing the SocketsHttpHandler connection pool across tests.
-        _httpHandler ??= new Http.TUnitBaggagePropagationHandler
+        _httpHandler ??= new SocketsHttpHandler
         {
-            InnerHandler = new SocketsHttpHandler
-            {
-                // Match Aspire's CreateHttpClient behavior: trust dev certs for HTTPS resources
-                SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
-            },
+            // Match Aspire's CreateHttpClient behavior: trust dev certs for HTTPS resources
+            SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
         };
 
         return new HttpClient(_httpHandler, disposeHandler: false)
@@ -367,7 +361,6 @@ public class AspireFixture<TAppHost> : IAsyncInitializer, IAsyncDisposable
     // --- OTLP Telemetry ---
 
     private const string DashboardOtlpEndpointEnvVar = "DOTNET_DASHBOARD_OTLP_ENDPOINT_URL";
-    private const string OtelExporterEndpointEnvVar = "OTEL_EXPORTER_OTLP_ENDPOINT";
     private const string OtelExporterProtocolEnvVar = "OTEL_EXPORTER_OTLP_PROTOCOL";
     private const string OtelServiceNameEnvVar = "OTEL_SERVICE_NAME";
     private const string OtelBlrpScheduleDelayEnvVar = "OTEL_BLRP_SCHEDULE_DELAY";
@@ -385,6 +378,7 @@ public class AspireFixture<TAppHost> : IAsyncInitializer, IAsyncDisposable
     private void ConfigureOtlpEndpoints(IDistributedApplicationTestingBuilder builder)
     {
         var otlpEndpoint = $"http://127.0.0.1:{_otlpReceiver!.Port}";
+        var receiver = _otlpReceiver;
 
         foreach (var resource in builder.Resources)
         {
@@ -395,7 +389,16 @@ public class AspireFixture<TAppHost> : IAsyncInitializer, IAsyncDisposable
                 projectResource.Annotations.Add(
                     new EnvironmentCallbackAnnotation(context =>
                     {
-                        context.EnvironmentVariables[OtelExporterEndpointEnvVar] = otlpEndpoint;
+                        // Forward to user's dashboard if they set OTEL_EXPORTER_OTLP_ENDPOINT
+                        // themselves (#4818), otherwise their spans get dropped by the override.
+                        var userEndpoint = OtlpEndpointEnvironment.CaptureAndOverride(
+                            context.EnvironmentVariables,
+                            otlpEndpoint);
+                        if (userEndpoint is not null)
+                        {
+                            receiver.UpstreamEndpoint = userEndpoint;
+                        }
+
                         context.EnvironmentVariables[OtelExporterProtocolEnvVar] = "http/protobuf";
 
                         // Set the service name from the Aspire resource name so

@@ -1,10 +1,10 @@
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
 using TUnit.Mocks.SourceGenerator.Extensions;
 using TUnit.Mocks.SourceGenerator.Models;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using static TUnit.Mocks.SourceGenerator.IdentifierEscaping;
 
 namespace TUnit.Mocks.SourceGenerator.Discovery;
 
@@ -53,10 +53,19 @@ internal static class MemberDiscovery
             {
                 if (member.IsStatic)
                 {
-                    if (member.IsAbstract)
-                    {
-                        CollectStaticAbstractMember(member, interfaceFqn, methods, properties, events, seenMethods, seenProperties, seenEvents, ref memberIdCounter);
-                    }
+                    TryCollectStaticAbstractFromInterface(member, typeSymbol, interfaceFqn, methods, properties, events, seenMethods, seenProperties, seenEvents, ref memberIdCounter);
+                    continue;
+                }
+
+                // For class partial mocks, the base class already implements (or inherits) all
+                // interface members — re-emitting them as `public override` fails to compile
+                // when the base impl is non-virtual or explicit (#5673:
+                // EntityEntry explicitly implements IInfrastructure<InternalEntityEntry>.Instance).
+                // The inherited impl satisfies the interface; the mock only needs to override
+                // what the class walk already collected (virtual/abstract/override members).
+                if (typeSymbol.TypeKind == TypeKind.Class
+                    && typeSymbol.FindImplementationForInterfaceMember(member) is not null)
+                {
                     continue;
                 }
 
@@ -157,6 +166,9 @@ internal static class MemberDiscovery
     /// <summary>
     /// Discovers members from multiple type symbols, merging and deduplicating across all.
     /// Used for multi-interface mocks like Mock.Of&lt;T1, T2&gt;().
+    /// Note: the first element may be a class when invoked from
+    /// <c>MockTypeDiscovery.TransformToModels</c> with <c>isPartialMock == true</c>, so the
+    /// <see cref="TryCollectStaticAbstractFromInterface"/> TypeKind guard is genuinely required.
     /// </summary>
     public static (EquatableArray<MockMemberModel> Methods, EquatableArray<MockMemberModel> Properties, EquatableArray<MockEventModel> Events)
         DiscoverMembersFromMultipleTypes(INamedTypeSymbol[] typeSymbols, IAssemblySymbol? compilationAssembly = null)
@@ -187,10 +199,7 @@ internal static class MemberDiscovery
                 {
                     if (member.IsStatic)
                     {
-                        if (member.IsAbstract)
-                        {
-                            CollectStaticAbstractMember(member, interfaceFqn, methods, properties, events, seenMethods, seenProperties, seenEvents, ref memberIdCounter);
-                        }
+                        TryCollectStaticAbstractFromInterface(member, typeSymbol, interfaceFqn, methods, properties, events, seenMethods, seenProperties, seenEvents, ref memberIdCounter);
                         continue;
                     }
 
@@ -342,6 +351,13 @@ internal static class MemberDiscovery
                         var key = GetMethodKey(method);
                         // Seed both seen sets so the interface loop doesn't re-add class members
                         seenFullMethods.Add(GetFullMethodKey(method));
+                        // ref / ref readonly returns can't be routed through the mock engine —
+                        // treat them as non-mockable so the inherited impl flows through unchanged.
+                        if (method.ReturnsByRef || method.ReturnsByRefReadonly)
+                        {
+                            seenMethods.TryAdd(key, NonMockableEntry);
+                            break;
+                        }
                         if (method.IsAbstract || method.IsVirtual || method.IsOverride)
                         {
                             if (seenMethods.ContainsKey(key)) continue;
@@ -758,7 +774,7 @@ internal static class MemberDiscovery
                     Name = EscapeIdentifier(p.Name),
                     Type = p.Type.GetMinimallyQualifiedNameWithNullability(),
                     FullyQualifiedType = p.Type.GetFullyQualifiedNameWithNullability(),
-                    Direction = ParameterDirection.In
+                    Direction = p.GetParameterDirection()
                 }).ToImmutableArray()
             ),
             ExplicitInterfaceName = explicitInterfaceName,
@@ -1022,13 +1038,6 @@ internal static class MemberDiscovery
             + "\"";
 
     /// <summary>
-    /// Escapes a parameter name that is a C# reserved keyword by prepending '@'.
-    /// E.g., "event" → "@event", "class" → "@class", "return" → "@return".
-    /// </summary>
-    private static string EscapeIdentifier(string name) =>
-        SyntaxFacts.GetKeywordKind(name) != SyntaxKind.None ? "@" + name : name;
-
-    /// <summary>
     /// For ReadOnlySpan&lt;T&gt; or Span&lt;T&gt; types, returns the fully qualified element type.
     /// Returns null for all other types.
     /// </summary>
@@ -1049,6 +1058,41 @@ internal static class MemberDiscovery
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Internal predicate consumed only by <see cref="TryCollectStaticAbstractFromInterface"/>.
+    /// Class targets already provide the concrete static impl that satisfies any static-abstract
+    /// interface members; emitting a bridge interface for them would produce CS0527 (class in
+    /// interface list) and CS0540 (explicit interface impl on a type that doesn't list the
+    /// interface). Centralised here so no caller can bypass the gate by accident.
+    /// </summary>
+    private static bool ShouldCollectStaticAbstractFromInterfaces(ITypeSymbol typeSymbol)
+        => typeSymbol.TypeKind == TypeKind.Interface;
+
+    /// <summary>
+    /// Gated entry point used by every interface-member discovery loop for static members.
+    /// Derives the static-abstract collection flag from <paramref name="typeSymbol"/> internally
+    /// so that adding a future loop cannot silently re-introduce a class-target regression
+    /// (CS0527 / CS0540 from a class being treated like an interface) — the only way to collect
+    /// a static-abstract member is through this helper.
+    /// </summary>
+    private static void TryCollectStaticAbstractFromInterface(
+        ISymbol member,
+        ITypeSymbol typeSymbol,
+        string interfaceFqn,
+        List<MockMemberModel> methods,
+        List<MockMemberModel> properties,
+        List<MockEventModel> events,
+        Dictionary<string, (int Index, ITypeSymbol? ReturnType)> seenMethods,
+        Dictionary<string, int?> seenProperties,
+        HashSet<string> seenEvents,
+        ref int memberIdCounter)
+    {
+        if (!member.IsAbstract) return;
+        if (!ShouldCollectStaticAbstractFromInterfaces(typeSymbol)) return;
+
+        CollectStaticAbstractMember(member, interfaceFqn, methods, properties, events, seenMethods, seenProperties, seenEvents, ref memberIdCounter);
     }
 
     /// <summary>

@@ -509,6 +509,34 @@ public class MockGeneratorTests : SnapshotTestBase
     }
 
     [Test]
+    public Task Interface_With_Keyword_Member_Names()
+    {
+        // Mixed coverage for #5679: keyword-named property, keyword-named method,
+        // keyword-named parameters (reuses the existing parameter-escape path).
+        var source = """
+            using TUnit.Mocks;
+
+            public interface IEscapedNames
+            {
+                int @class { get; }
+                string @record();
+                void @event(int @params);
+                int @namespace(int @new, int @static);
+            }
+
+            public class TestUsage
+            {
+                void M()
+                {
+                    var mock = Mock.Of<IEscapedNames>();
+                }
+            }
+            """;
+
+        return VerifyGeneratorOutput(source);
+    }
+
+    [Test]
     public Task Interface_With_Static_Abstract_Members()
     {
         var source = """
@@ -528,6 +556,46 @@ public class MockGeneratorTests : SnapshotTestBase
                 void M()
                 {
                     var mock = Mock.Of<IServiceFactory>();
+                }
+            }
+            """;
+
+        return VerifyGeneratorOutput(source);
+    }
+
+    [Test]
+    public Task Class_Implementing_Static_Abstract_Interface()
+    {
+        // Mirrors the T15 KitchenSink shape: a class implementing an interface that has a
+        // static-abstract member plus an instance virtual member. The generator must NOT
+        // emit a MockBridge interface for class targets (CS0527 / CS0540); the class
+        // already provides the concrete static impl, the mock only overrides the
+        // instance-virtual surface.
+        //
+        // The verified snapshot for this test intentionally OMITS a `_MockBridge.g.cs`
+        // file section — that absence is the assertion. Class targets must not get
+        // bridge generation, unlike the interface-target variants in this file which
+        // do produce a bridge.
+        var source = """
+            using TUnit.Mocks;
+
+            public interface IStaticAbstractFactory
+            {
+                static abstract IStaticAbstractFactory Create();
+                int InstanceValue { get; }
+            }
+
+            public class StaticAbstractImpl : IStaticAbstractFactory
+            {
+                public static IStaticAbstractFactory Create() => new StaticAbstractImpl();
+                public virtual int InstanceValue => 99;
+            }
+
+            public class TestUsage
+            {
+                void M()
+                {
+                    var mock = StaticAbstractImpl.Mock();
                 }
             }
             """;
@@ -1344,6 +1412,65 @@ public class MockGeneratorTests : SnapshotTestBase
             """;
 
         AssertGeneratedCodeHasNoNullableWarnings(source);
+        return VerifyGeneratorOutput(source);
+    }
+
+    [Test]
+    public Task Class_With_Required_Members()
+    {
+        // Regression for #5678: when a partial-mocked base class has `required` members,
+        // the generated impl ctor must carry [SetsRequiredMembers] so the factory can
+        // `new XxxMockImpl(engine)` without CS9035 (member must be initialized).
+        var source = """
+            using TUnit.Mocks;
+
+            public class ConfigBase
+            {
+                public required string Name { get; set; }
+                public required object Settings { get; init; }
+            }
+
+            public class TestUsage
+            {
+                void M()
+                {
+                    var mock = Mock.Of<ConfigBase>();
+                }
+            }
+            """;
+
+        return VerifyGeneratorOutput(source);
+    }
+
+    [Test]
+    public Task SelfEquatable_Generates_EqualsOf_GetHashCodeOf_ToStringOf()
+    {
+        // Regression for #5675: self-referential IEquatable<T> together with
+        // overrides of GetHashCode/ToString must produce disambiguated extension
+        // helpers (EqualsOf / GetHashCodeOf / ToStringOf) on the generated mock,
+        // because C# overload resolution always prefers the inherited object
+        // instance methods over an extension named the same.
+        var source = """
+            using System;
+            using TUnit.Mocks;
+
+            public class SelfEquatableSnapshot : IEquatable<SelfEquatableSnapshot>
+            {
+                public virtual bool Equals(SelfEquatableSnapshot? other) => ReferenceEquals(this, other);
+                public override bool Equals(object? obj) => obj is SelfEquatableSnapshot s && Equals(s);
+                public override int GetHashCode() => 0;
+                public override string ToString() => "base";
+            }
+
+            public class TestUsage
+            {
+                void M()
+                {
+                    var mock = Mock.Of<SelfEquatableSnapshot>();
+                }
+            }
+            """;
+
         return VerifyGeneratorOutput(source);
     }
 

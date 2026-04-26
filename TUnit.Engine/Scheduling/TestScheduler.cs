@@ -27,7 +27,9 @@ internal sealed class TestScheduler : ITestScheduler
     private readonly StaticPropertyHandler _staticPropertyHandler;
     private readonly IDynamicTestQueue _dynamicTestQueue;
     private readonly Lazy<int> _maxParallelism;
-    private readonly Lazy<SemaphoreSlim?> _maxParallelismSemaphore;
+#if !NET
+    private readonly Lazy<SemaphoreSlim> _maxParallelismSemaphore;
+#endif
 
     public TestScheduler(
         TUnitFrameworkLogger logger,
@@ -57,13 +59,16 @@ internal sealed class TestScheduler : ITestScheduler
 
         _maxParallelism = new Lazy<int>(() => GetMaxParallelism(logger, commandLineOptions));
 
-        _maxParallelismSemaphore = new Lazy<SemaphoreSlim?>(() =>
-            _maxParallelism.Value == int.MaxValue
-                ? null
-                : new SemaphoreSlim(_maxParallelism.Value, _maxParallelism.Value));
+#if !NET
+        // The .NET 8+ path uses Parallel.ForEachAsync which caps concurrency via
+        // ParallelOptions.MaxDegreeOfParallelism — the semaphore is only needed
+        // for the netstandard2.0 fallback path.
+        _maxParallelismSemaphore = new Lazy<SemaphoreSlim>(() =>
+            new SemaphoreSlim(_maxParallelism.Value, _maxParallelism.Value));
+#endif
     }
 
-    #if NET8_0_OR_GREATER
+    #if NET
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Test execution involves reflection for hooks and initialization")]
     #endif
     public async Task<bool> ScheduleAndExecuteAsync(
@@ -156,7 +161,7 @@ internal sealed class TestScheduler : ITestScheduler
         return true;
     }
 
-    #if NET8_0_OR_GREATER
+    #if NET
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Test execution involves reflection for hooks and initialization")]
     #endif
     private async Task ExecuteGroupedTestsAsync(
@@ -232,7 +237,7 @@ internal sealed class TestScheduler : ITestScheduler
         await dynamicTestProcessingTask.ConfigureAwait(false);
     }
 
-    #if NET8_0_OR_GREATER
+    #if NET
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Test execution involves reflection for hooks and initialization")]
     #endif
     private async Task ProcessDynamicTestQueueAsync(CancellationToken cancellationToken)
@@ -305,46 +310,24 @@ internal sealed class TestScheduler : ITestScheduler
         }
     }
 
-#if NET8_0_OR_GREATER
+#if NET
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Test execution involves reflection for hooks and initialization")]
     #endif
-    private async Task ExecuteTestsAsync(
+    private Task ExecuteTestsAsync(
         AbstractExecutableTest[] tests,
         CancellationToken cancellationToken)
     {
-        var semaphore = _maxParallelismSemaphore.Value;
-        if (semaphore != null)
-        {
-            await ExecuteWithGlobalLimitAsync(tests, semaphore, cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-#if NET8_0_OR_GREATER
-            // Use Parallel.ForEachAsync for bounded concurrency (eliminates unbounded Task.Run queue depth)
-            // This dramatically reduces ThreadPool contention and GetQueuedCompletionStatus waits
-            await Parallel.ForEachAsync(
-                tests,
-                new ParallelOptions { CancellationToken = cancellationToken },
-                async (test, ct) =>
-                {
-                    test.ExecutionTask ??= _testRunner.ExecuteTestAsync(test, ct).AsTask();
-                    await test.ExecutionTask.ConfigureAwait(false);
-                }
-            ).ConfigureAwait(false);
+        // All paths run through the shared limiter so the DOP cap is unified in
+        // GetMaxParallelism. "Unlimited" is resolved to the default cap
+        // (ProcessorCount * 4) there rather than being a separate code path.
+#if NET
+        return ExecuteWithGlobalLimitAsync(tests, cancellationToken);
 #else
-            // Fallback for netstandard2.0: use Task.WhenAll (still better than unbounded Task.Run)
-            var tasks = new Task[tests.Length];
-            for (var i = 0; i < tests.Length; i++)
-            {
-                var test = tests[i];
-                tasks[i] = test.ExecutionTask ??= _testRunner.ExecuteTestAsync(test, cancellationToken).AsTask();
-            }
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+        return ExecuteWithGlobalLimitAsync(tests, _maxParallelismSemaphore.Value, cancellationToken);
 #endif
-        }
     }
 
-#if NET8_0_OR_GREATER
+#if NET
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Test execution involves reflection for hooks and initialization")]
     #endif
     private async Task ExecuteSequentiallyAsync(
@@ -358,19 +341,16 @@ internal sealed class TestScheduler : ITestScheduler
         }
     }
 
-    private async Task ExecuteWithGlobalLimitAsync(
+#if NET
+    private Task ExecuteWithGlobalLimitAsync(
         AbstractExecutableTest[] tests,
-        SemaphoreSlim globalSemaphore,
         CancellationToken cancellationToken)
     {
-        var maxParallelism = _maxParallelism.Value;
-
-#if NET8_0_OR_GREATER
-        await Parallel.ForEachAsync(
+        return Parallel.ForEachAsync(
             tests,
             new ParallelOptions
             {
-                MaxDegreeOfParallelism = maxParallelism,
+                MaxDegreeOfParallelism = _maxParallelism.Value,
                 CancellationToken = cancellationToken
             },
             async (test, ct) =>
@@ -378,8 +358,14 @@ internal sealed class TestScheduler : ITestScheduler
                 test.ExecutionTask ??= _testRunner.ExecuteTestAsync(test, ct).AsTask();
                 await test.ExecutionTask.ConfigureAwait(false);
             }
-        ).ConfigureAwait(false);
+        );
+    }
 #else
+    private async Task ExecuteWithGlobalLimitAsync(
+        AbstractExecutableTest[] tests,
+        SemaphoreSlim globalSemaphore,
+        CancellationToken cancellationToken)
+    {
         // Fallback for netstandard2.0: Manual bounded concurrency using existing semaphore
         var tasks = new Task[tests.Length];
         for (var i = 0; i < tests.Length; i++)
@@ -400,8 +386,8 @@ internal sealed class TestScheduler : ITestScheduler
             }, CancellationToken.None);
         }
         await Task.WhenAll(tasks).ConfigureAwait(false);
-#endif
     }
+#endif
 
     private async Task WaitForTasksWithFailFastHandling(IEnumerable<Task> tasks, CancellationToken cancellationToken)
     {
@@ -427,6 +413,12 @@ internal sealed class TestScheduler : ITestScheduler
 
     private static int GetMaxParallelism(ILogger logger, ICommandLineOptions commandLineOptions)
     {
+        // "Unlimited" (caller passed 0) resolves to the same cap as the default path.
+        // Parallel.ForEachAsync with MaxDegreeOfParallelism = -1 is truly unbounded —
+        // with thousands of tests this saturates IOCP threads, so we always apply a cap.
+        // ProcessorCount * 4 is empirically sized for async/IO-bound workloads.
+        var defaultLimit = Environment.ProcessorCount * 4;
+
         // Check command line argument first (highest priority)
         if (commandLineOptions.TryGetOptionArgumentList(
                 MaximumParallelTestsCommandProvider.MaximumParallelTests,
@@ -434,9 +426,11 @@ internal sealed class TestScheduler : ITestScheduler
         {
             if (maxParallelTests == 0)
             {
-                // 0 means unlimited (backwards compat for advanced users)
-                logger.LogDebug("Maximum parallel tests: unlimited (from command line)");
-                return int.MaxValue;
+                // 0 historically meant "unlimited"; we now treat it the same as the
+                // default cap so the unlimited path is not a regression against the
+                // default path.
+                logger.LogDebug($"Maximum parallel tests: unlimited requested from command line, capped to default {defaultLimit} to avoid IOCP saturation");
+                return defaultLimit;
             }
 
             if (maxParallelTests > 0)
@@ -452,8 +446,8 @@ internal sealed class TestScheduler : ITestScheduler
         {
             if (envLimit == 0)
             {
-                logger.LogDebug("Maximum parallel tests: unlimited (from TUNIT_MAX_PARALLEL_TESTS environment variable)");
-                return int.MaxValue;
+                logger.LogDebug($"Maximum parallel tests: unlimited requested from TUNIT_MAX_PARALLEL_TESTS, capped to default {defaultLimit} to avoid IOCP saturation");
+                return defaultLimit;
             }
 
             if (envLimit > 0)
@@ -468,8 +462,8 @@ internal sealed class TestScheduler : ITestScheduler
         {
             if (codeLimit == 0)
             {
-                logger.LogDebug("Maximum parallel tests: unlimited (from TUnitSettings)");
-                return int.MaxValue;
+                logger.LogDebug($"Maximum parallel tests: unlimited requested from TUnitSettings, capped to default {defaultLimit} to avoid IOCP saturation");
+                return defaultLimit;
             }
 
             logger.LogDebug($"Maximum parallel tests limit set to {codeLimit} (from TUnitSettings)");
@@ -478,7 +472,6 @@ internal sealed class TestScheduler : ITestScheduler
 
         // Default: 4x CPU cores (empirically optimized for async/IO-bound workloads)
         // Users can override via --maximum-parallel-tests or TUNIT_MAX_PARALLEL_TESTS
-        var defaultLimit = Environment.ProcessorCount * 4;
         logger.LogDebug($"Maximum parallel tests limit defaulting to {defaultLimit} ({Environment.ProcessorCount} processors * 4)");
         return defaultLimit;
     }

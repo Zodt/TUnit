@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 using TUnit.Mocks.SourceGenerator.Models;
+using static TUnit.Mocks.SourceGenerator.IdentifierEscaping;
 
 namespace TUnit.Mocks.SourceGenerator.Builders;
 
@@ -16,10 +17,30 @@ internal static class MockMembersBuilder
     private const int MaxTypedParams = 8;
     private const int MaxFuncOverloadParams = 4;
 
+    // Two distinct shadowing problems below — different fixes because the kinds collide differently.
+
+    // "Object" clashes with the Mock<T>.Object PROPERTY (member-kind collision: property vs.
+    // generated method/property). A trailing underscore is enough since nothing on object
+    // is named "Object_".
     private static readonly HashSet<string> MockMemberNames = new(System.StringComparer.Ordinal)
     {
         "Object",
-        "GetHashCode", "GetType", "ToString", "Equals"
+    };
+
+    // Equals/GetHashCode/ToString clash with inherited object INSTANCE METHODS.
+    // C# overload resolution always prefers an instance method on the receiver over an
+    // extension method, so a generated `Equals` extension is unreachable (mock.Equals(...)
+    // binds to object.Equals and returns bool). A trailing-underscore rename would also be
+    // reachable, but we use an "Of" suffix to read naturally at the call site
+    // (mock.EqualsOf(other).Returns(true)).
+    // GetType is intentionally omitted: it is non-virtual on object and therefore
+    // cannot be overridden or shadowed in a meaningful way, so any generated helper
+    // would be dead code.
+    private static readonly Dictionary<string, string> ObjectMemberDisambiguations = new(System.StringComparer.Ordinal)
+    {
+        { "Equals", "EqualsOf" },
+        { "GetHashCode", "GetHashCodeOf" },
+        { "ToString", "ToStringOf" },
     };
 
     public static string Build(MockTypeModel model)
@@ -71,6 +92,19 @@ internal static class MockMembersBuilder
                     if (!firstMember) writer.AppendLine();
                     firstMember = false;
                     GeneratePropertyExtensionBlock(writer, memberProps, model, safeName);
+                }
+
+                // Indexers -- expose as Item(...)/SetItem(..., value) extension methods so
+                // setups and verifications can target distinct index values independently.
+                // Each indexer overload (different parameter signature) gets its own pair.
+                var indexers = model.Properties
+                    .Where(p => p.IsIndexer && !p.IsStaticAbstract)
+                    .ToList();
+                foreach (var indexer in indexers)
+                {
+                    if (!firstMember) writer.AppendLine();
+                    firstMember = false;
+                    GenerateIndexerExtensionMethods(writer, indexer, model);
                 }
 
                 // Raise extension methods for events (skip static abstract)
@@ -133,11 +167,24 @@ internal static class MockMembersBuilder
         return matchableParams.Count <= MaxTypedParams;
     }
 
+    // method.Name is intentionally embedded raw (unescaped) here. The result is a compound
+    // identifier like "IFoo_event_M2_MockCall" — even when method.Name is a C# keyword such as
+    // "event" or "class", it appears only as a non-terminal substring of a larger token, which is
+    // a valid C# identifier. Escaping (via EscapeIdentifier) is only required when the name would
+    // stand alone as a complete identifier in the emitted source.
+    // Note: safeName itself may legitimately start with '@' (when the member name is a reserved
+    // keyword and GetSafeMemberName routed it through EscapeIdentifier), yielding e.g.
+    // "@event_someMethod_M0_MockCall". This is valid C#: the '@' prefix applies to the entire
+    // compound identifier, and the resulting token after '@' is not itself a keyword.
     private static string GetWrapperName(string safeName, MockMemberModel method)
         => $"{safeName}_{method.Name}_M{method.MemberId}_MockCall";
 
     private static string GetSafeMemberName(string name)
-        => MockMemberNames.Contains(name) ? name + "_" : name;
+    {
+        if (ObjectMemberDisambiguations.TryGetValue(name, out var renamed))
+            return renamed;
+        return EscapeIdentifier(MockMemberNames.Contains(name) ? name + "_" : name);
+    }
 
     private static string GetCombinedTypeParameterList(MockTypeModel model, MockMemberModel method)
     {
@@ -212,8 +259,6 @@ internal static class MockMembersBuilder
             writer.AppendLine("private readonly string _memberName;");
             writer.AppendLine("private readonly global::TUnit.Mocks.Arguments.IArgumentMatcher[] _matchers;");
             writer.AppendLine($"private {builderType}? _builder;");
-            writer.AppendLine("private bool _builderInitialized;");
-            writer.AppendLine("private object? _builderLock;");
             writer.AppendLine();
 
             // Constructor
@@ -228,7 +273,7 @@ internal static class MockMembersBuilder
 
             writer.AppendLine();
 
-            // EnsureSetup method — uses LazyInitializer to guarantee exactly-once AddSetup
+            // EnsureSetup — CAS-based lazy init (see EmitEnsureSetup)
             EmitEnsureSetup(writer, builderType);
 
             writer.AppendLine();
@@ -324,8 +369,6 @@ internal static class MockMembersBuilder
             writer.AppendLine("private readonly string _memberName;");
             writer.AppendLine("private readonly global::TUnit.Mocks.Arguments.IArgumentMatcher[] _matchers;");
             writer.AppendLine($"private {builderType}? _builder;");
-            writer.AppendLine("private bool _builderInitialized;");
-            writer.AppendLine("private object? _builderLock;");
             writer.AppendLine();
 
             // Constructor — eagerly registers because void methods
@@ -342,7 +385,7 @@ internal static class MockMembersBuilder
 
             writer.AppendLine();
 
-            // EnsureSetup method — uses LazyInitializer to guarantee exactly-once AddSetup
+            // EnsureSetup — CAS-based lazy init (see EmitEnsureSetup)
             EmitEnsureSetup(writer, builderType);
 
             writer.AppendLine();
@@ -1033,6 +1076,54 @@ internal static class MockMembersBuilder
         }
     }
 
+    /// <summary>
+    /// Emits <c>Item(args...)</c> and (optionally) <c>SetItem(args..., value)</c> extension methods
+    /// for an indexer, returning <see cref="MockMethodCall{TReturn}"/> / <see cref="VoidMockMethodCall"/>
+    /// so that callers can configure (<c>.Returns()</c>) and verify (<c>.WasCalled()</c>) per-index.
+    /// </summary>
+    private static void GenerateIndexerExtensionMethods(CodeWriter writer, MockMemberModel indexer, MockTypeModel model)
+    {
+        var mockableType = MockImplBuilder.GetMockableTypeName(model);
+        var typeParams = MockImplBuilder.GetTypeParameterList(model);
+        var constraints = MockImplBuilder.GetConstraintClauses(model);
+        var extensionParam = $"this global::TUnit.Mocks.Mock<{mockableType}> mock";
+
+        // Indexer parameters as Arg<T> so callers can pass a literal, Arg.Any<T>(), etc.
+        var argParams = string.Join(", ", indexer.Parameters.Select(p =>
+            $"global::TUnit.Mocks.Arguments.Arg<{p.FullyQualifiedType}> {p.Name}"));
+        var matcherList = indexer.Parameters.Length == 0
+            ? "global::System.Array.Empty<global::TUnit.Mocks.Arguments.IArgumentMatcher>()"
+            : $"new global::TUnit.Mocks.Arguments.IArgumentMatcher[] {{ {string.Join(", ", indexer.Parameters.Select(p => $"{p.Name}.Matcher"))} }}";
+
+        if (indexer.HasGetter)
+        {
+            writer.AppendLineIfNotEmpty(indexer.ObsoleteAttribute);
+            var getterParams = string.IsNullOrEmpty(argParams) ? extensionParam : $"{extensionParam}, {argParams}";
+            using (writer.Block($"public static global::TUnit.Mocks.MockMethodCall<{indexer.ReturnType}> Item{typeParams}({getterParams}){constraints}"))
+            {
+                writer.AppendLine($"var matchers = {matcherList};");
+                writer.AppendLine($"return new global::TUnit.Mocks.MockMethodCall<{indexer.ReturnType}>(global::TUnit.Mocks.MockRegistry.GetEngine(mock), {indexer.MemberId}, \"get_Item\", matchers);");
+            }
+        }
+
+        if (indexer.HasSetter)
+        {
+            if (indexer.HasGetter) writer.AppendLine();
+            writer.AppendLineIfNotEmpty(indexer.ObsoleteAttribute);
+            var valueParam = $"global::TUnit.Mocks.Arguments.Arg<{indexer.ReturnType}> value";
+            var setterArgParams = string.IsNullOrEmpty(argParams) ? valueParam : $"{argParams}, {valueParam}";
+            var setterParams = $"{extensionParam}, {setterArgParams}";
+            var setterMatcherList = indexer.Parameters.Length == 0
+                ? "new global::TUnit.Mocks.Arguments.IArgumentMatcher[] { value.Matcher }"
+                : $"new global::TUnit.Mocks.Arguments.IArgumentMatcher[] {{ {string.Join(", ", indexer.Parameters.Select(p => $"{p.Name}.Matcher"))}, value.Matcher }}";
+            using (writer.Block($"public static global::TUnit.Mocks.VoidMockMethodCall SetItem{typeParams}({setterParams}){constraints}"))
+            {
+                writer.AppendLine($"var matchers = {setterMatcherList};");
+                writer.AppendLine($"return new global::TUnit.Mocks.VoidMockMethodCall(global::TUnit.Mocks.MockRegistry.GetEngine(mock), {indexer.SetterMemberId}, \"set_Item\", matchers);");
+            }
+        }
+    }
+
     private static void GenerateRaiseExtensionMethods(CodeWriter writer, MockTypeModel model)
     {
         var mockableType = MockImplBuilder.GetMockableTypeName(model);
@@ -1136,15 +1227,33 @@ internal static class MockMembersBuilder
 
     private static void EmitEnsureSetup(CodeWriter writer, string builderType)
     {
-        writer.AppendLine($"private {builderType} EnsureSetup() =>");
-        writer.IncreaseIndent();
-        writer.AppendLine($"global::System.Threading.LazyInitializer.EnsureInitialized(ref _builder, ref _builderInitialized, ref _builderLock, () =>");
-        writer.OpenBrace();
-        writer.AppendLine("var setup = new global::TUnit.Mocks.Setup.MethodSetup(_memberId, _matchers, _memberName);");
-        writer.AppendLine("_engine.AddSetup(setup);");
-        writer.AppendLine($"return new {builderType}(setup);");
-        writer.CloseBrace(")!;");
-        writer.DecreaseIndent();
+        // CAS-based lazy init avoids the LazyInitializer Func closure and its two scratch fields.
+        writer.AppendLine($"private {builderType} EnsureSetup()");
+        using (writer.Block())
+        {
+            writer.AppendLine($"var existing = global::System.Threading.Volatile.Read(ref _builder);");
+            writer.AppendLine("if (existing is not null) return existing;");
+            writer.AppendLine("return EnsureSetupSlow();");
+        }
+
+        writer.AppendLine();
+        // Race note: if two threads lose/win the CAS, the loser returns before the winner
+        // calls AddSetup. Mock setup is sequential in normal usage (test setup phase completes
+        // before invocations), so this window is not observable. If you ever need concurrent
+        // setup + invocation of the same method-wrapper, reintroduce synchronization here.
+        writer.AppendLine("[global::System.Runtime.CompilerServices.MethodImpl(global::System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]");
+        writer.AppendLine($"private {builderType} EnsureSetupSlow()");
+        using (writer.Block())
+        {
+            writer.AppendLine("var setup = new global::TUnit.Mocks.Setup.MethodSetup(_memberId, _matchers, _memberName);");
+            writer.AppendLine($"var fresh = new {builderType}(setup);");
+            writer.AppendLine($"var prev = global::System.Threading.Interlocked.CompareExchange(ref _builder, fresh, null);");
+            writer.AppendLine("if (prev is not null) return prev;");
+            writer.AppendLine("// AddSetup runs only on the CAS winner. Setup is sequential in practice,");
+            writer.AppendLine("// so a concurrent loser observing the builder before registration is benign.");
+            writer.AppendLine("_engine.AddSetup(setup);");
+            writer.AppendLine("return fresh;");
+        }
     }
 
 }

@@ -62,7 +62,9 @@ public static class AutoStart
         var builder = Sdk.CreateTracerProviderBuilder()
             .AddSource("TUnit")
             .AddSource("TUnit.Lifecycle")
-            .AddSource("TUnit.AspNetCore.Http")
+            // Without this subscription, runtime-emitted HttpClient spans are created but
+            // not exported, leaving orphan-parent server spans on the SUT side.
+            .AddSource("System.Net.Http")
             .AddProcessor(new TUnitTestCorrelationProcessor());
 
         if (otlpEndpoint is not null)
